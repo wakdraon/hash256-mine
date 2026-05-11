@@ -9,6 +9,9 @@ const { hashRate, shortHex } = require("./lib/format");
 const RPC_URL = process.env.RPC_URL;
 const PRIVATE_KEY = process.env.PRIVATE_KEY;
 
+const MAX_RETRIES = 5;
+const BASE_DELAY_MS = 1000;
+
 function requireEnv() {
   if (!RPC_URL || !PRIVATE_KEY) {
     console.error("Isi RPC_URL dan PRIVATE_KEY di file .env dulu.");
@@ -20,6 +23,25 @@ function requireEnv() {
     console.error("PRIVATE_KEY harus diawali 0x.");
     process.exit(1);
   }
+}
+
+async function retry(fn, label) {
+  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      const msg = err.shortMessage || err.message;
+      if (attempt === MAX_RETRIES) throw err;
+      const delay = BASE_DELAY_MS * Math.pow(2, attempt - 1);
+      console.error(`${label} gagal (attempt ${attempt}/${MAX_RETRIES}): ${msg}`);
+      console.error(`Retry dalam ${delay / 1000}s...`);
+      await sleep(delay);
+    }
+  }
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 async function main() {
@@ -35,9 +57,9 @@ async function main() {
   console.log("Backend:", options.backend);
 
   while (true) {
-    const state = await contract.miningState();
+    const state = await retry(() => contract.miningState(), "miningState()");
     const difficulty = BigInt(state.difficulty.toString());
-    const challenge = await contract.getChallenge(wallet.address);
+    const challenge = await retry(() => contract.getChallenge(wallet.address), "getChallenge()");
 
     console.log("");
     console.log("Era:", state.era.toString());
@@ -52,6 +74,12 @@ async function main() {
     console.log("FOUND via", solution.backend);
     console.log("Nonce:", solution.nonce);
     console.log("Hash:", solution.hash);
+
+    const currentChallenge = await retry(() => contract.getChallenge(wallet.address), "getChallenge() (verify)");
+    if (currentChallenge !== challenge) {
+      console.error("Challenge berubah sebelum submit. Epoch baru, cari ulang...");
+      continue;
+    }
 
     await submitSolution({ contract, nonce: BigInt(solution.nonce), options });
 
@@ -140,11 +168,15 @@ async function feeOptions(provider, priorityFeeGwei) {
 
 function progressPrinter() {
   let last = 0;
-  return ({ backend, hashes, hashrate }) => {
+  return ({ backend, hashes, hashrate, totalHashes, avgHashrate }) => {
     const now = Date.now();
     if (now - last < 2000) return;
     last = now;
-    process.stdout.write(`\r${backend} ${hashRate(hashrate)} | ${shortHex(hashes.toString())} hashes`);
+    let line = `\r${backend} ${hashRate(hashrate)}`;
+    if (avgHashrate) line += ` (avg ${hashRate(avgHashrate)})`;
+    const total = totalHashes || hashes;
+    line += ` | ${shortHex(total.toString())} hashes`;
+    process.stdout.write(line);
   };
 }
 

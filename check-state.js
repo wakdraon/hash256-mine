@@ -1,14 +1,9 @@
 require("dotenv").config();
 
 const { ethers } = require("ethers");
+const { ABI, CONTRACT_ADDRESS } = require("./lib/config");
 
 const RPC_URL = process.env.RPC_URL;
-const CONTRACT_ADDRESS = "0xAC7b5d06fa1e77D08aea40d46cB7C5923A87A0cc";
-
-const ABI = [
-  "function miningState() view returns (uint256 era,uint256 reward,uint256 difficulty,uint256 minted,uint256 remaining,uint256 epoch,uint256 epochBlocksLeft_)",
-  "function genesisState() view returns (uint256,uint256,uint256,bool)"
-];
 
 if (!RPC_URL) {
   console.error("Isi RPC_URL di file .env dulu.");

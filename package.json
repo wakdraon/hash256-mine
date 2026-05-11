@@ -8,7 +8,9 @@
     "start:cpu": "node miner.js --backend cpu",
     "start:gpu": "node miner.js --backend opencl",
     "check": "node check-state.js",
-    "build:opencl": "node scripts/build-opencl.js"
+    "build:opencl": "node scripts/build-opencl.js",
+    "start:telegram": "node mine-telegram.js",
+    "start:telegram:gpu": "node mine-telegram.js --backend opencl"
   },
   "keywords": [
     "hash256",
@@ -20,7 +22,8 @@
   "license": "MIT",
   "dependencies": {
     "dotenv": "^16.4.7",
-    "ethers": "^6.13.5"
+    "ethers": "^6.13.5",
+    "js-sha3": "^0.9.3"
   },
   "engines": {
     "node": ">=18"
