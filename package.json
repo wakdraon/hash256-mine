@@ -5,7 +5,10 @@
   "main": "miner.js",
   "scripts": {
     "start": "node miner.js",
-    "check": "node check-state.js"
+    "start:cpu": "node miner.js --backend cpu",
+    "start:gpu": "node miner.js --backend opencl",
+    "check": "node check-state.js",
+    "build:opencl": "node scripts/build-opencl.js"
   },
   "keywords": [
     "hash256",

@@ -2,164 +2,183 @@
 
 CLI miner untuk HASH256 dari `https://hash256.org/mine`.
 
-Script ini mengambil challenge dari smart contract, mencari nonce yang memenuhi difficulty, lalu submit transaksi `mine(nonce)` ke Ethereum mainnet.
+Miner ini mengambil challenge dari kontrak, mencari nonce untuk
+`keccak256(abi.encodePacked(challenge, nonce)) < difficulty`, lalu submit
+`mine(nonce)` ke Ethereum mainnet. Secara default miner akan mencoba GPU
+OpenCL kalau binary tersedia, lalu fallback ke CPU worker threads.
 
 ## Peringatan
 
-- Mining ini memakai Ethereum mainnet.
-- Wallet harus punya ETH untuk gas.
-- Jangan pakai private key wallet utama. Lebih aman pakai wallet baru khusus mining.
+- Mining memakai Ethereum mainnet dan butuh ETH untuk gas.
+- Jangan pakai private key wallet utama. Buat wallet khusus mining.
 - Jangan commit file `.env`.
-- Verifikasi sendiri alamat kontrak sebelum mengirim transaksi: `https://etherscan.io/address/0xAC7b5d06fa1e77D08aea40d46cB7C5923A87A0cc`.
+- Verifikasi kontrak sendiri:
+  `https://etherscan.io/address/0xAC7b5d06fa1e77D08aea40d46cB7C5923A87A0cc`.
 
-## Kebutuhan
-
-- Ubuntu/VPS
-- Node.js 18 atau lebih baru
-- npm
-- Wallet Ethereum
-- Private key wallet
-- ETH untuk gas
-- RPC Ethereum mainnet
-
-## Install Node.js dan npm
-
-Kalau memakai user biasa Ubuntu:
+## Install Cepat
 
 ```bash
-cd ~
-
-sudo apt update
-sudo apt install -y curl ca-certificates gnupg
-
-curl -fsSL https://deb.nodesource.com/setup_22.x | sudo bash -
-sudo apt install -y nodejs
-
-node -v
-npm -v
-```
-
-Kalau login sebagai root:
-
-```bash
-cd ~
-
-apt update
-apt install -y curl ca-certificates gnupg
-
-curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
-apt install -y nodejs
-
-node -v
-npm -v
-```
-
-## Setup Project
-
-```bash
-git clone <URL_REPO_KAMU>
+git clone https://github.com/mrfunntastiic/hash256-mine
 cd hash256-cli
-
 npm install
 cp .env.example .env
 nano .env
 ```
 
-Isi `.env`:
+Isi minimal:
 
 ```env
 RPC_URL=https://ethereum-rpc.publicnode.com
 PRIVATE_KEY=0xPRIVATE_KEY_WALLET_KAMU
+MINER_BACKEND=auto
+PRIORITY_FEE_GWEI=2
 ```
 
-Simpan di nano:
-
-```text
-CTRL + X
-Y
-Enter
-```
-
-## Cek State Kontrak
+Jalankan cek kontrak:
 
 ```bash
 npm run check
 ```
 
-Output akan menampilkan `genesisState` dan `miningState`.
-
-## Jalankan Miner
+Jalankan miner:
 
 ```bash
 npm start
 ```
 
-Contoh output:
+## Mode CPU
 
-```text
-Wallet: 0x....
-Contract: 0xAC7b5d06fa1e77D08aea40d46cB7C5923A87A0cc
+CPU mode tidak perlu driver GPU:
 
-Era: ...
-Reward: ... HASH
-Difficulty: ...
-Epoch: ...
-Challenge: 0x...
-........
-FOUND nonce: ...
-Hash: 0x...
-TX sent: 0x...
-Success block: ...
+```bash
+npm run start:cpu
+```
+
+Opsional:
+
+```env
+CPU_WORKERS=8
+CPU_BATCH_SIZE=50000
+```
+
+## Mode GPU OpenCL
+
+GPU mode memakai OpenCL native binary, bukan native npm addon. Ini sengaja
+dibuat agar instalasi lebih stabil.
+
+### Ubuntu / Debian
+
+Install dependency umum:
+
+```bash
+sudo apt update
+sudo apt install -y build-essential ocl-icd-opencl-dev clinfo
+```
+
+Install runtime GPU:
+
+- NVIDIA: install driver NVIDIA terbaru.
+- AMD: install ROCm/OpenCL runtime yang cocok untuk GPU kamu.
+- Intel: install Intel OpenCL runtime.
+
+Cek OpenCL:
+
+```bash
+clinfo | head
+```
+
+Build miner GPU:
+
+```bash
+sh scripts/build-opencl.sh
+```
+
+Run GPU:
+
+```bash
+npm run start:gpu
+```
+
+### Windows
+
+Install salah satu:
+
+- MSYS2/MinGW + OpenCL SDK, atau
+- Visual Studio Build Tools + OpenCL SDK dari vendor GPU.
+
+Build:
+
+```powershell
+npm run build:opencl
+```
+
+Run:
+
+```powershell
+npm run start:gpu
+```
+
+Kalau binary GPU belum ada, `MINER_BACKEND=auto` akan fallback ke CPU. Kalau
+ingin wajib GPU, pakai:
+
+```env
+MINER_BACKEND=opencl
+```
+
+## Opsi
+
+```bash
+node miner.js --backend auto
+node miner.js --backend cpu --workers 8
+node miner.js --backend opencl --gpu-batch 67108864
+node miner.js --once
+```
+
+Environment yang berguna:
+
+```env
+MINER_BACKEND=auto
+CPU_WORKERS=8
+CPU_BATCH_SIZE=50000
+GPU_BATCH_SIZE=67108864
+OPENCL_MINER_BIN=./bin/hash256-opencl
+PRIORITY_FEE_GWEI=2
+KEEP_MINING=true
 ```
 
 ## Error Umum
 
-### `npm: command not found`
+### `OpenCL miner belum ada`
 
-Node.js/npm belum terinstall.
-
-```bash
-sudo apt update
-sudo apt install -y nodejs npm
-```
-
-Atau pakai NodeSource seperti instruksi install di atas.
-
-### Permission denied saat `apt update`
-
-Kamu bukan root.
+Build binary GPU dulu:
 
 ```bash
-sudo apt update
-sudo apt install -y nodejs npm
+sh scripts/build-opencl.sh
 ```
 
-### `Isi RPC_URL dan PRIVATE_KEY di file .env dulu`
+atau di Windows:
 
-File `.env` belum dibuat atau isinya belum benar.
+```powershell
+npm run build:opencl
+```
+
+### `clGetDeviceIDs(GPU)`
+
+Driver OpenCL GPU belum terpasang atau GPU tidak terdeteksi. Jalankan:
 
 ```bash
-cat .env
-```
-
-Harus ada:
-
-```env
-RPC_URL=...
-PRIVATE_KEY=...
+clinfo
 ```
 
 ### `insufficient funds`
 
-Wallet tidak punya ETH untuk gas. Isi ETH dulu ke wallet tersebut.
+Wallet tidak punya ETH untuk gas.
 
-### `execution reverted`
+### `execution reverted` atau `InsufficientWork`
 
-Kemungkinan mining belum aktif, nonce tidak valid, atau state kontrak berubah. Jalankan ulang miner atau cek state kontrak.
-
-### `InsufficientWork`
-
-Nonce yang ditemukan tidak memenuhi difficulty saat transaksi diproses. Jalankan ulang miner.
+Epoch/challenge berubah sebelum transaksi masuk, block-cap sudah penuh, atau
+nonce kalah cepat dari miner lain. Jalankan ulang dan naikkan
+`PRIORITY_FEE_GWEI` kalau perlu.
 
 ### `GenesisNotComplete`
 
