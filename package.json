@@ -8,7 +8,9 @@
     "start:cpu": "node miner.js --backend cpu",
     "start:gpu": "node miner.js --backend opencl",
     "check": "node check-state.js",
-    "build:opencl": "node scripts/build-opencl.js"
+    "build:opencl": "node scripts/build-opencl.js",
+    "start:telegram": "node mine-telegram.js",
+    "start:telegram:gpu": "node mine-telegram.js --backend opencl"
   },
   "keywords": [
     "hash256",
