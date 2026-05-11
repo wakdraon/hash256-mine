@@ -168,11 +168,15 @@ async function feeOptions(provider, priorityFeeGwei) {
 
 function progressPrinter() {
   let last = 0;
-  return ({ backend, hashes, hashrate }) => {
+  return ({ backend, hashes, hashrate, totalHashes, avgHashrate }) => {
     const now = Date.now();
     if (now - last < 2000) return;
     last = now;
-    process.stdout.write(`\r${backend} ${hashRate(hashrate)} | ${shortHex(hashes.toString())} hashes`);
+    let line = `\r${backend} ${hashRate(hashrate)}`;
+    if (avgHashrate) line += ` (avg ${hashRate(avgHashrate)})`;
+    const total = totalHashes || hashes;
+    line += ` | ${shortHex(total.toString())} hashes`;
+    process.stdout.write(line);
   };
 }
 

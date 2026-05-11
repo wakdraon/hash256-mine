@@ -65,6 +65,25 @@ static double wall_time(void) {
   return ts.tv_sec + ts.tv_nsec * 1e-9;
 }
 
+static size_t auto_batch_size(cl_device_id device) {
+  cl_ulong mem = 0;
+  clGetDeviceInfo(device, CL_DEVICE_GLOBAL_MEM_SIZE, sizeof(mem), &mem, NULL);
+  cl_uint compute_units = 0;
+  clGetDeviceInfo(device, CL_DEVICE_MAX_COMPUTE_UNITS, sizeof(compute_units), &compute_units, NULL);
+
+  size_t batch;
+  if (mem >= 20ULL * 1024 * 1024 * 1024)      batch = 256 * 1024 * 1024;
+  else if (mem >= 10ULL * 1024 * 1024 * 1024)  batch = 128 * 1024 * 1024;
+  else if (mem >= 6ULL * 1024 * 1024 * 1024)   batch = 64 * 1024 * 1024;
+  else                                          batch = 32 * 1024 * 1024;
+
+  if (compute_units >= 80) batch = batch * 2;
+  else if (compute_units >= 40) batch = (batch * 3) / 2;
+
+  batch = (batch / 256) * 256;
+  return batch;
+}
+
 static int mine_device(cl_device_id device, int device_index,
                        uint32_t challenge[8], uint32_t difficulty[8],
                        size_t batch, uint64_t start_base) {
@@ -76,7 +95,7 @@ static int mine_device(cl_device_id device, int device_index,
   CHECK_CL(err, "clCreateCommandQueue");
   cl_program program = clCreateProgramWithSource(context, 1, &KERNEL, NULL, &err);
   CHECK_CL(err, "clCreateProgramWithSource");
-  err = clBuildProgram(program, 1, &device, "", NULL, NULL);
+  err = clBuildProgram(program, 1, &device, "-cl-mad-enable -cl-fast-relaxed-math", NULL, NULL);
   if (err != CL_SUCCESS) {
     char log[8192];
     clGetProgramBuildInfo(program, device, CL_PROGRAM_BUILD_LOG, sizeof(log), log, NULL);
@@ -86,6 +105,18 @@ static int mine_device(cl_device_id device, int device_index,
 
   cl_kernel kernel = clCreateKernel(program, "mine", &err);
   CHECK_CL(err, "clCreateKernel");
+
+  size_t preferred_wg = 0;
+  clGetKernelWorkGroupInfo(kernel, device, CL_KERNEL_PREFERRED_WORK_GROUP_SIZE_MULTIPLE,
+                           sizeof(preferred_wg), &preferred_wg, NULL);
+  if (preferred_wg < 32) preferred_wg = 64;
+  size_t local_wg = preferred_wg * 4;
+  size_t max_wg = 0;
+  clGetKernelWorkGroupInfo(kernel, device, CL_KERNEL_WORK_GROUP_SIZE, sizeof(max_wg), &max_wg, NULL);
+  if (local_wg > max_wg) local_wg = max_wg;
+  batch = (batch / local_wg) * local_wg;
+  if (batch < local_wg) batch = local_wg;
+
   cl_mem challenge_buf = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, sizeof(uint32_t) * 8, challenge, &err);
   CHECK_CL(err, "challenge buffer");
   cl_mem difficulty_buf = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, sizeof(uint32_t) * 8, difficulty, &err);
@@ -94,9 +125,18 @@ static int mine_device(cl_device_id device, int device_index,
   cl_mem result_buf = clCreateBuffer(context, CL_MEM_READ_WRITE, sizeof(result), NULL, &err);
   CHECK_CL(err, "result buffer");
 
+  CHECK_CL(clSetKernelArg(kernel, 0, sizeof(cl_mem), &challenge_buf), "arg0");
+  CHECK_CL(clSetKernelArg(kernel, 1, sizeof(cl_mem), &difficulty_buf), "arg1");
+  CHECK_CL(clSetKernelArg(kernel, 3, sizeof(cl_mem), &result_buf), "arg3");
+
+  fprintf(stderr, "GPU %d: batch=%zu local_wg=%zu preferred_wg_multiple=%zu\n",
+          device_index, batch, local_wg, preferred_wg);
+
   uint64_t base = start_base;
   uint64_t total = 0;
+  uint64_t grand_total = 0;
   double started = wall_time();
+  double grand_start = started;
 
   for (;;) {
     if (base > UINT64_MAX - batch) {
@@ -106,20 +146,21 @@ static int mine_device(cl_device_id device, int device_index,
 
     memset(&result, 0, sizeof(result));
     CHECK_CL(clEnqueueWriteBuffer(queue, result_buf, CL_TRUE, 0, sizeof(result), &result, 0, NULL, NULL), "clear result");
-    CHECK_CL(clSetKernelArg(kernel, 0, sizeof(cl_mem), &challenge_buf), "arg0");
-    CHECK_CL(clSetKernelArg(kernel, 1, sizeof(cl_mem), &difficulty_buf), "arg1");
     CHECK_CL(clSetKernelArg(kernel, 2, sizeof(uint64_t), &base), "arg2");
-    CHECK_CL(clSetKernelArg(kernel, 3, sizeof(cl_mem), &result_buf), "arg3");
-    CHECK_CL(clEnqueueNDRangeKernel(queue, kernel, 1, NULL, &batch, NULL, 0, NULL, NULL), "enqueue");
+    CHECK_CL(clEnqueueNDRangeKernel(queue, kernel, 1, NULL, &batch, &local_wg, 0, NULL, NULL), "enqueue");
     CHECK_CL(clFinish(queue), "finish");
     CHECK_CL(clEnqueueReadBuffer(queue, result_buf, CL_TRUE, 0, sizeof(result), &result, 0, NULL, NULL), "read result");
 
     total += batch;
+    grand_total += batch;
     if (result.found) {
       uint64_t nonce = ((uint64_t)result.nonce_hi << 32) | result.nonce_lo;
+      double elapsed = wall_time() - grand_start;
       printf("{\"type\":\"found\",\"nonce\":\"%llu\",\"hash\":\"", (unsigned long long)nonce);
       print_hash(result.hash);
-      printf("\",\"hashes\":\"%llu\",\"gpu\":%d}\n", (unsigned long long)total, device_index);
+      printf("\",\"hashes\":\"%llu\",\"gpu\":%d,\"elapsed\":%.1f,\"avg_hashrate\":%.0f}\n",
+             (unsigned long long)grand_total, device_index, elapsed,
+             elapsed > 0 ? grand_total / elapsed : 0);
       fflush(stdout);
 
       clReleaseMemObject(challenge_buf);
@@ -134,8 +175,11 @@ static int mine_device(cl_device_id device, int device_index,
 
     double seconds = wall_time() - started;
     if (seconds > 0.5) {
-      printf("{\"type\":\"progress\",\"hashes\":\"%llu\",\"hashrate\":%.0f,\"gpu\":%d}\n",
-             (unsigned long long)total, total / seconds, device_index);
+      double grand_elapsed = wall_time() - grand_start;
+      printf("{\"type\":\"progress\",\"hashes\":\"%llu\",\"hashrate\":%.0f,\"gpu\":%d,\"total\":\"%llu\",\"avg_hashrate\":%.0f}\n",
+             (unsigned long long)total, total / seconds, device_index,
+             (unsigned long long)grand_total,
+             grand_elapsed > 0 ? grand_total / grand_elapsed : 0);
       fflush(stdout);
       started = wall_time();
       total = 0;
@@ -154,8 +198,8 @@ static int mine_device(cl_device_id device, int device_index,
 }
 
 int main(int argc, char **argv) {
-  if (argc < 4) {
-    fprintf(stderr, "usage: %s <challenge_hex> <difficulty_hex> <batch_size> [gpu_index]\n", argv[0]);
+  if (argc < 3) {
+    fprintf(stderr, "usage: %s <challenge_hex> <difficulty_hex> [batch_size] [gpu_index]\n", argv[0]);
     return 2;
   }
 
@@ -164,10 +208,6 @@ int main(int argc, char **argv) {
     fprintf(stderr, "challenge/difficulty must be 32-byte hex\n");
     return 2;
   }
-
-  size_t batch = (size_t)strtoull(argv[3], NULL, 10);
-  if (batch < 65536) batch = 65536;
-  batch = (batch / 64) * 64;
 
   int gpu_index = -1;
   if (argc >= 5) gpu_index = atoi(argv[4]);
@@ -194,19 +234,30 @@ int main(int argc, char **argv) {
   fprintf(stderr, "Found %u GPU device(s)\n", num_devices);
   for (cl_uint i = 0; i < num_devices; i++) {
     char name[256] = {0};
+    cl_ulong mem = 0;
+    cl_uint cu = 0;
     clGetDeviceInfo(devices[i], CL_DEVICE_NAME, sizeof(name), name, NULL);
-    fprintf(stderr, "  GPU %u: %s\n", i, name);
+    clGetDeviceInfo(devices[i], CL_DEVICE_GLOBAL_MEM_SIZE, sizeof(mem), &mem, NULL);
+    clGetDeviceInfo(devices[i], CL_DEVICE_MAX_COMPUTE_UNITS, sizeof(cu), &cu, NULL);
+    fprintf(stderr, "  GPU %u: %s (%llu MB, %u CUs)\n", i, name,
+            (unsigned long long)(mem / (1024 * 1024)), cu);
   }
 
-  if (gpu_index >= 0) {
-    if ((cl_uint)gpu_index >= num_devices) {
-      fprintf(stderr, "GPU index %d out of range (0-%u)\n", gpu_index, num_devices - 1);
-      return 2;
-    }
-    uint64_t start_base = ((uint64_t)time(NULL) << 32) ^ (uint64_t)clock();
-    return mine_device(devices[gpu_index], gpu_index, challenge, difficulty, batch, start_base);
+  int selected = (gpu_index >= 0) ? gpu_index : 0;
+  if ((cl_uint)selected >= num_devices) {
+    fprintf(stderr, "GPU index %d out of range (0-%u)\n", selected, num_devices - 1);
+    return 2;
+  }
+
+  size_t batch;
+  if (argc >= 4 && strtoull(argv[3], NULL, 10) > 0) {
+    batch = (size_t)strtoull(argv[3], NULL, 10);
+    if (batch < 65536) batch = 65536;
+  } else {
+    batch = auto_batch_size(devices[selected]);
+    fprintf(stderr, "Auto batch size: %zu (%.1f M)\n", batch, batch / 1e6);
   }
 
   uint64_t start_base = ((uint64_t)time(NULL) << 32) ^ (uint64_t)clock();
-  return mine_device(devices[0], 0, challenge, difficulty, batch, start_base);
+  return mine_device(devices[selected], selected, challenge, difficulty, batch, start_base);
 }
