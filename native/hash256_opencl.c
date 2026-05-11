@@ -6,6 +6,7 @@
 #include <time.h>
 
 #define CHECK_CL(x, msg) do { cl_int _err = (x); if (_err != CL_SUCCESS) { fprintf(stderr, "%s: %d\n", msg, _err); return 1; } } while (0)
+#define MAX_DEVICES 16
 
 typedef struct {
   uint32_t found;
@@ -58,33 +59,16 @@ static void print_hash(uint32_t h[8]) {
   for (int i = 0; i < 8; i++) printf("%08x", h[i]);
 }
 
-int main(int argc, char **argv) {
-  if (argc < 4) {
-    fprintf(stderr, "usage: %s <challenge_hex> <difficulty_hex> <batch_size>\n", argv[0]);
-    return 2;
-  }
+static double wall_time(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return ts.tv_sec + ts.tv_nsec * 1e-9;
+}
 
-  unsigned char challenge_bytes[32], difficulty_bytes[32];
-  if (!parse_hex32(argv[1], challenge_bytes) || !parse_hex32(argv[2], difficulty_bytes)) {
-    fprintf(stderr, "challenge/difficulty must be 32-byte hex\n");
-    return 2;
-  }
-
-  size_t batch = (size_t)strtoull(argv[3], NULL, 10);
-  if (batch < 65536) batch = 65536;
-  batch = (batch / 64) * 64;
-
-  uint32_t challenge[8], difficulty[8];
-  for (int i = 0; i < 8; i++) {
-    challenge[i] = le32(challenge_bytes + i * 4);
-    difficulty[i] = be32(difficulty_bytes + i * 4);
-  }
-
+static int mine_device(cl_device_id device, int device_index,
+                       uint32_t challenge[8], uint32_t difficulty[8],
+                       size_t batch, uint64_t start_base) {
   cl_int err;
-  cl_platform_id platform;
-  cl_device_id device;
-  CHECK_CL(clGetPlatformIDs(1, &platform, NULL), "clGetPlatformIDs");
-  CHECK_CL(clGetDeviceIDs(platform, CL_DEVICE_TYPE_GPU, 1, &device, NULL), "clGetDeviceIDs(GPU)");
 
   cl_context context = clCreateContext(NULL, 1, &device, NULL, NULL, &err);
   CHECK_CL(err, "clCreateContext");
@@ -96,25 +80,30 @@ int main(int argc, char **argv) {
   if (err != CL_SUCCESS) {
     char log[8192];
     clGetProgramBuildInfo(program, device, CL_PROGRAM_BUILD_LOG, sizeof(log), log, NULL);
-    fprintf(stderr, "%s\n", log);
+    fprintf(stderr, "GPU %d build error: %s\n", device_index, log);
     return 1;
   }
 
   cl_kernel kernel = clCreateKernel(program, "mine", &err);
   CHECK_CL(err, "clCreateKernel");
-  cl_mem challenge_buf = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, sizeof(challenge), challenge, &err);
+  cl_mem challenge_buf = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, sizeof(uint32_t) * 8, challenge, &err);
   CHECK_CL(err, "challenge buffer");
-  cl_mem difficulty_buf = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, sizeof(difficulty), difficulty, &err);
+  cl_mem difficulty_buf = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, sizeof(uint32_t) * 8, difficulty, &err);
   CHECK_CL(err, "difficulty buffer");
   Result result;
   cl_mem result_buf = clCreateBuffer(context, CL_MEM_READ_WRITE, sizeof(result), NULL, &err);
   CHECK_CL(err, "result buffer");
 
-  uint64_t base = ((uint64_t)time(NULL) << 32) ^ (uint64_t)clock();
+  uint64_t base = start_base;
   uint64_t total = 0;
-  clock_t started = clock();
+  double started = wall_time();
 
   for (;;) {
+    if (base > UINT64_MAX - batch) {
+      fprintf(stderr, "GPU %d: nonce space exhausted\n", device_index);
+      break;
+    }
+
     memset(&result, 0, sizeof(result));
     CHECK_CL(clEnqueueWriteBuffer(queue, result_buf, CL_TRUE, 0, sizeof(result), &result, 0, NULL, NULL), "clear result");
     CHECK_CL(clSetKernelArg(kernel, 0, sizeof(cl_mem), &challenge_buf), "arg0");
@@ -130,18 +119,94 @@ int main(int argc, char **argv) {
       uint64_t nonce = ((uint64_t)result.nonce_hi << 32) | result.nonce_lo;
       printf("{\"type\":\"found\",\"nonce\":\"%llu\",\"hash\":\"", (unsigned long long)nonce);
       print_hash(result.hash);
-      printf("\",\"hashes\":\"%llu\"}\n", (unsigned long long)total);
+      printf("\",\"hashes\":\"%llu\",\"gpu\":%d}\n", (unsigned long long)total, device_index);
       fflush(stdout);
+
+      clReleaseMemObject(challenge_buf);
+      clReleaseMemObject(difficulty_buf);
+      clReleaseMemObject(result_buf);
+      clReleaseKernel(kernel);
+      clReleaseProgram(program);
+      clReleaseCommandQueue(queue);
+      clReleaseContext(context);
       return 0;
     }
 
-    double seconds = (double)(clock() - started) / CLOCKS_PER_SEC;
+    double seconds = wall_time() - started;
     if (seconds > 0.5) {
-      printf("{\"type\":\"progress\",\"hashes\":\"%llu\",\"hashrate\":%.0f}\n", (unsigned long long)total, total / seconds);
+      printf("{\"type\":\"progress\",\"hashes\":\"%llu\",\"hashrate\":%.0f,\"gpu\":%d}\n",
+             (unsigned long long)total, total / seconds, device_index);
       fflush(stdout);
-      started = clock();
+      started = wall_time();
       total = 0;
     }
     base += batch;
   }
+
+  clReleaseMemObject(challenge_buf);
+  clReleaseMemObject(difficulty_buf);
+  clReleaseMemObject(result_buf);
+  clReleaseKernel(kernel);
+  clReleaseProgram(program);
+  clReleaseCommandQueue(queue);
+  clReleaseContext(context);
+  return 1;
+}
+
+int main(int argc, char **argv) {
+  if (argc < 4) {
+    fprintf(stderr, "usage: %s <challenge_hex> <difficulty_hex> <batch_size> [gpu_index]\n", argv[0]);
+    return 2;
+  }
+
+  unsigned char challenge_bytes[32], difficulty_bytes[32];
+  if (!parse_hex32(argv[1], challenge_bytes) || !parse_hex32(argv[2], difficulty_bytes)) {
+    fprintf(stderr, "challenge/difficulty must be 32-byte hex\n");
+    return 2;
+  }
+
+  size_t batch = (size_t)strtoull(argv[3], NULL, 10);
+  if (batch < 65536) batch = 65536;
+  batch = (batch / 64) * 64;
+
+  int gpu_index = -1;
+  if (argc >= 5) gpu_index = atoi(argv[4]);
+
+  uint32_t challenge[8], difficulty[8];
+  for (int i = 0; i < 8; i++) {
+    challenge[i] = le32(challenge_bytes + i * 4);
+    difficulty[i] = be32(difficulty_bytes + i * 4);
+  }
+
+  cl_int err;
+  cl_platform_id platform;
+  CHECK_CL(clGetPlatformIDs(1, &platform, NULL), "clGetPlatformIDs");
+
+  cl_uint num_devices = 0;
+  cl_device_id devices[MAX_DEVICES];
+  CHECK_CL(clGetDeviceIDs(platform, CL_DEVICE_TYPE_GPU, MAX_DEVICES, devices, &num_devices), "clGetDeviceIDs(GPU)");
+
+  if (num_devices == 0) {
+    fprintf(stderr, "No GPU devices found\n");
+    return 1;
+  }
+
+  fprintf(stderr, "Found %u GPU device(s)\n", num_devices);
+  for (cl_uint i = 0; i < num_devices; i++) {
+    char name[256] = {0};
+    clGetDeviceInfo(devices[i], CL_DEVICE_NAME, sizeof(name), name, NULL);
+    fprintf(stderr, "  GPU %u: %s\n", i, name);
+  }
+
+  if (gpu_index >= 0) {
+    if ((cl_uint)gpu_index >= num_devices) {
+      fprintf(stderr, "GPU index %d out of range (0-%u)\n", gpu_index, num_devices - 1);
+      return 2;
+    }
+    uint64_t start_base = ((uint64_t)time(NULL) << 32) ^ (uint64_t)clock();
+    return mine_device(devices[gpu_index], gpu_index, challenge, difficulty, batch, start_base);
+  }
+
+  uint64_t start_base = ((uint64_t)time(NULL) << 32) ^ (uint64_t)clock();
+  return mine_device(devices[0], 0, challenge, difficulty, batch, start_base);
 }
