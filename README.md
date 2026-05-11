@@ -19,7 +19,7 @@ OpenCL kalau binary tersedia, lalu fallback ke CPU worker threads.
 
 ```bash
 git clone https://github.com/mrfunntastiic/hash256-mine
-cd hash256-cli
+cd hash256-mine
 npm install
 cp .env.example .env
 nano .env
